@@ -1,0 +1,382 @@
+------------------------------------------
+----- =======[ Load WindUI ]
+-------------------------------------------
+
+local Version = "1.6.45"
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/download/" .. Version .. "/main.lua"))()
+
+-------------------------------------------
+----- =======[ GLOBAL & CORE FUNCTIONS ]
+-------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local player = Players.LocalPlayer
+
+-- Safe require helper
+local function safeRequire(pathTbl)
+    local ptr = ReplicatedStorage
+    for _, seg in ipairs(pathTbl) do
+        ptr = ptr:FindFirstChild(seg)
+        if not ptr then return nil end
+    end
+    local ok, mod = pcall(require, ptr)
+    return ok and mod or nil
+end
+
+-- Initialize controllers and utilities
+local FishingController = safeRequire({"Controllers","FishingController"})
+local AnimationController = safeRequire({"Controllers","AnimationController"})
+local Replion = safeRequire({"Packages","Replion"}) or safeRequire({"Packages","replion"})
+local ItemUtility = safeRequire({"Shared","ItemUtility"})
+
+-- Net folder helper
+local function getNetFolder()
+    local packages = ReplicatedStorage:WaitForChild("Packages", 10)
+    if not packages then return nil end
+    local index = packages:FindFirstChild("_Index")
+    if index then
+        for _, child in ipairs(index:GetChildren()) do
+            if child.Name:match("^sleitnick_net@") then
+                return child:FindFirstChild("net")
+            end
+        end
+    end
+    return ReplicatedStorage:FindFirstChild("net") or ReplicatedStorage:FindFirstChild("Net")
+end
+
+-- =========================
+-- STATE MANAGEMENT
+-- =========================
+local state = {
+    AutoFish = false,
+    AutoFavourite = false,
+    AutoSell = false,
+}
+
+local allowedTiers = { [4]=true, [5]=true, [6]=true, [7]=true }
+
+-- =========================
+-- AUTO FAVOURITE
+-- =========================
+local function startAutoFavourite()
+    task.spawn(function()
+        while state.AutoFavourite do
+            pcall(function()
+                if not Replion or not ItemUtility then return end
+                local netFolder = getNetFolder()
+                local favoriteRemote = netFolder and netFolder:FindFirstChild("RE/FavoriteItem")
+                if not favoriteRemote then return end
+
+                local DataReplion = Replion.Client:WaitReplion("Data")
+                local items = DataReplion and DataReplion:Get({"Inventory","Items"})
+                if type(items) ~= "table" then return end
+                for _, item in ipairs(items) do
+                    local base = ItemUtility:GetItemData(item.Id)
+                    if base and base.Data and allowedTiers[base.Data.Tier] and not item.Favorited then
+                        favoriteRemote:FireServer(item.UUID)
+                        item.Favorited = true
+                    end
+                end
+            end)
+            task.wait(5)
+        end
+    end)
+end
+
+-- =========================
+-- AUTO SELL
+-- =========================
+local lastSellTime = 0
+local AUTO_SELL_THRESHOLD = 60
+local AUTO_SELL_DELAY = 60
+
+local function startAutoSell()
+    task.spawn(function()
+        while state.AutoSell do
+            pcall(function()
+                if not Replion then return end
+                local DataReplion = Replion.Client:WaitReplion("Data")
+                local items = DataReplion and DataReplion:Get({"Inventory","Items"})
+                if type(items) ~= "table" then return end
+
+                local unfavoritedCount = 0
+                for _, item in ipairs(items) do
+                    if not item.Favorited then
+                        unfavoritedCount += (item.Count or 1)
+                    end
+                end
+
+                if unfavoritedCount >= AUTO_SELL_THRESHOLD and os.time() - lastSellTime >= AUTO_SELL_DELAY then
+                    local netFolder = getNetFolder()
+                    if netFolder then
+                        local sellFunc = netFolder:FindFirstChild("RF/SellAllItems")
+                        if sellFunc then
+                            task.spawn(sellFunc.InvokeServer, sellFunc)
+                            lastSellTime = os.time()
+                        end
+                    end
+                end
+            end)
+            task.wait(10)
+        end
+    end)
+end
+
+-- =========================
+-- AUTO FISH
+-- =========================
+local autoFishLoop
+local function playCastAnim()
+    pcall(function()
+        if AnimationController and AnimationController.PlayAnimation then
+            AnimationController:PlayAnimation("CastFromFullChargePosition1Hand")
+        end
+    end)
+end
+
+local function startAutoFish()
+    if autoFishLoop then task.cancel(autoFishLoop) end
+    autoFishLoop = task.spawn(function()
+        local net = getNetFolder(); if not net then return end
+        local equipEvent = net:WaitForChild("RE/EquipToolFromHotbar")
+        local chargeFunc = net:WaitForChild("RF/ChargeFishingRod")
+        local startMini  = net:WaitForChild("RF/RequestFishingMinigameStarted")
+        local complete   = net:WaitForChild("RE/FishingCompleted")
+
+        while state.AutoFish do
+            if FishingController and FishingController.OnCooldown and FishingController:OnCooldown() then
+                repeat task.wait(0.2) until not FishingController:OnCooldown() or not state.AutoFish
+            end
+            if not state.AutoFish then break end
+
+            pcall(function()
+                playCastAnim()
+                equipEvent:FireServer(1)
+                task.wait(0.1)
+                chargeFunc:InvokeServer(workspace:GetServerTimeNow())
+                task.wait(0.1)
+                startMini:InvokeServer(-0.75, 1)
+                task.wait(0.2)
+                for i=1,20 do
+                    complete:FireServer()
+                    task.wait(0.05)
+                end
+            end)
+
+            local t = os.clock()
+            while os.clock() - t < 1.5 and state.AutoFish do task.wait() end
+        end
+    end)
+end
+
+local function stopAutoFish()
+    if autoFishLoop then task.cancel(autoFishLoop); autoFishLoop = nil end
+end
+
+-- =========================
+-- TELEPORT
+-- =========================
+local function teleportTo(posList)
+    local char = player.Character or player.CharacterAdded:Wait()
+    local hrp = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart")
+
+    if hrp then
+        local chosen = typeof(posList) == "table" and posList[math.random(1,#posList)] or posList
+        hrp.CFrame = chosen
+    end
+end
+
+-------------------------------------------
+----- =======[ UI SETUP ]
+-------------------------------------------
+
+local Window = WindUI:CreateWindow({
+    Title = "e-Fishery V1",
+    Icon = "shrimp",
+    Author = "by Zee (WindUI Edition)",
+    Folder = "e-Fishery",
+    Size = UDim2.fromOffset(600, 400),
+    Transparent = true,
+    Theme = "Dark",
+    KeySystem = false,
+    ScrollBarEnabled = true,
+    HideSearchBar = true,
+})
+
+local Main = Window:Tab({ Title = "Main", Icon = "toggle-right" })
+local AutoFarm = Window:Tab({ Title = "Auto Farm", Icon = "map" })
+local FishNotif = Window:Tab({ Title = "Fish Notification", Icon = "bell-ring" })
+
+-- =========================
+-- MAIN TAB
+-- =========================
+Main:Toggle({
+    Title = "Auto Fish",
+    Callback = function(Value)
+        state.AutoFish = Value
+        if Value then startAutoFish() else stopAutoFish() end
+    end
+})
+
+Main:Toggle({
+    Title = "Auto Favourite (Epic+)",
+    Callback = function(Value)
+        state.AutoFavourite = Value
+        if Value then startAutoFavourite() end
+    end
+})
+
+Main:Toggle({
+    Title = "Auto Sell (Threshold)",
+    Callback = function(Value)
+        state.AutoSell = Value
+        if Value then startAutoSell() end
+    end
+})
+
+-- =========================
+-- FISH NOTIFICATION (Replaced with working version)
+-- =========================
+do
+    local webhookState = { 
+        enabled = false, 
+        connection = nil, 
+        lastFish = "", 
+        lastSend = 0,
+        discordId = "",
+        customUrl = ""
+    }
+    local proxyUrl = "http://178.128.23.196:4007/notify"
+
+    local tierMap = {
+        [4] = "Epic",
+        [5] = "Legendary",
+        [6] = "Mythic",
+        [7] = "Secret"
+    }
+    local highTiers = {4, 5, 6, 7}
+
+    local function findItemModule(fullName)
+        local itemsFolder = ReplicatedStorage:FindFirstChild("Items")
+        if not itemsFolder then return nil end
+        local cleanedName = fullName:gsub("%s*%b()", ""):gsub("^%s*(.-)%s*$", "%1")
+        local bestMatch = nil
+        local longestMatchLength = 0
+        for _, itemModule in ipairs(itemsFolder:GetChildren()) do
+            if itemModule:IsA("ModuleScript") then
+                if cleanedName:find(itemModule.Name, 1, true) then
+                    if #itemModule.Name > longestMatchLength then
+                        longestMatchLength = #itemModule.Name
+                        bestMatch = itemModule
+                    end
+                end
+            end
+        end
+        return bestMatch
+    end
+
+    local function sendDataToProxy(data)
+        task.spawn(function()
+            pcall(function()
+                data.customUrl = webhookState.customUrl
+                HttpService:RequestAsync({
+                    Url = proxyUrl,
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = HttpService:JSONEncode(data)
+                })
+            end)
+        end)
+    end
+
+    FishNotif:Toggle({
+        Title = "Enable Fish Catch Notifications",
+        Desc = "Sends a notification to Discord for Epic+ fish.",
+        Value = false,
+        Callback = function(value)
+            webhookState.enabled = value
+            if value then
+                if webhookState.connection and webhookState.connection.Connected then return end
+                task.spawn(function()
+                    local itemNameLabel, rarityLabel
+                    repeat task.wait(1) 
+                        local smallNotif = player.PlayerGui:FindFirstChild("Small Notification")
+                        if smallNotif then
+                            local container = smallNotif:FindFirstChild("Display", true) and smallNotif.Display:FindFirstChild("Container", true)
+                            if container then
+                                itemNameLabel = container:FindFirstChild("ItemName", true)
+                                rarityLabel = container:FindFirstChild("Rarity", true)
+                            end
+                        end
+                    until (itemNameLabel and rarityLabel) or not webhookState.enabled
+                    
+                    if not webhookState.enabled then return end
+
+                    webhookState.connection = itemNameLabel:GetPropertyChangedSignal("Text"):Connect(function()
+                        if not webhookState.enabled then return end
+                        
+                        local currentTime = os.time()
+                        if currentTime - webhookState.lastSend < 2 then return end
+
+                        local fullFishName = itemNameLabel.Text
+                        if fullFishName == "" or fullFishName == webhookState.lastFish then return end
+                        
+                        webhookState.lastFish = fullFishName
+                        webhookState.lastSend = currentTime
+                        
+                        local itemModule = findItemModule(fullFishName)
+                        if not itemModule then return end
+
+                        local s, itemData = pcall(require, itemModule)
+                        if not (s and itemData and itemData.Data) then return end
+                        
+                        local tierNumber = itemData.Data.Tier
+                        if not table.find(highTiers, tierNumber) then return end
+                        
+                        local tierName = tierMap[tierNumber]
+                        local assetId = itemData.Data.Icon and itemData.Data.Icon:match("%d+")
+                        local sellPrice = itemData.SellPrice
+                        local rarity = rarityLabel.Text
+                        local weight = fullFishName:match("%((.+)%)")
+                        local cleanedFishName = fullFishName:gsub("%s*%b()%s*$", "")
+                        
+                        local totalCaught, bagSize = "N/A", "N/A"
+                        local leaderstats = player:FindFirstChild("leaderstats")
+                        if leaderstats and leaderstats:FindFirstChild("Caught") then
+                            totalCaught = tostring(leaderstats.Caught.Value)
+                        end
+
+                        local backpackGui = player.PlayerGui:FindFirstChild("Backpack")
+                        if backpackGui then
+                            local display = backpackGui:FindFirstChild("Display")
+                            local inventory = display and display:FindFirstChild("Inventory")
+                            local bagSizeLabel = inventory and inventory:FindFirstChild("BagSize")
+                            
+                            if bagSizeLabel and bagSizeLabel:IsA("TextLabel") then
+                                bagSize = bagSizeLabel.Text
+                            end
+                        end
+                        
+                        sendDataToProxy({
+                            discordId = webhookState.discordId,
+                            robloxUsername = player.Name,
+                            fishName = cleanedFishName,
+                            weight = weight,
+                            rarity = rarity,
+                            assetId = assetId,
+                            tierName = tierName,
+                            sellPrice = sellPrice,
+                            totalCaught = totalCaught,
+                            bagSize = bagSize
+                        })
+                    end)
+                end)
+            elseif not value and webhookState.connection and webhookState.connection.Connected then
+                webhookState.connection:Disconnect()
+                webhookState.connection = nil
+            end
+        end
+    })
+end
