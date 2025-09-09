@@ -1,0 +1,229 @@
+------------------------------------------
+----- =======[ Load WindUI ]
+-------------------------------------------
+
+local Version = "1.6.45"
+local WindUI = loadstring(game:HttpGet("https://github.com/Footagesus/WindUI/releases/download/" .. Version .. "/main.lua"))()
+
+-------------------------------------------
+----- =======[ GLOBAL & CORE FUNCTIONS ]
+-------------------------------------------
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local HttpService = game:GetService("HttpService")
+local player = Players.LocalPlayer
+
+-- Safe require helper from Rayfield version
+local function safeRequire(pathTbl)
+    local ptr = ReplicatedStorage
+    for _, seg in ipairs(pathTbl) do
+        ptr = ptr:FindFirstChild(seg)
+        if not ptr then return nil end
+    end
+    local ok, mod = pcall(require, ptr)
+    return ok and mod or nil
+end
+
+-- Initialize controllers and utilities
+local FishingController = safeRequire({"Controllers","FishingController"})
+local AnimationController = safeRequire({"Controllers","AnimationController"})
+local Replion = safeRequire({"Packages","Replion"}) or safeRequire({"Packages","replion"})
+local ItemUtility = safeRequire({"Shared","ItemUtility"})
+
+-- Net folder helper from Rayfield version
+local function getNetFolder()
+    local packages = ReplicatedStorage:WaitForChild("Packages", 10)
+    if not packages then return nil end
+    local index = packages:FindFirstChild("_Index")
+    if index then
+        for _, child in ipairs(index:GetChildren()) do
+            if child.Name:match("^sleitnick_net@") then
+                return child:FindFirstChild("net")
+            end
+        end
+    end
+    return ReplicatedStorage:FindFirstChild("net") or ReplicatedStorage:FindFirstChild("Net")
+end
+
+-- =========================
+-- STATE MANAGEMENT
+-- =========================
+local state = {
+    AutoFish = false,
+    AutoFavourite = false,
+    AutoSell = false,
+}
+
+-- Include Epic, Legendary, Mythic, Secret fish
+local allowedTiers = { [4]=true, [5]=true, [6]=true, [7]=true }
+
+-------------------------------------------
+----- =======[ NOTIFY FUNCTION ]
+-------------------------------------------
+
+local function NotifySuccess(title, message, duration)
+    WindUI:Notify({ Title = title, Content = message, Duration = duration or 5, Icon = "circle-check" })
+end
+
+local function NotifyError(title, message, duration)
+    WindUI:Notify({ Title = title, Content = message, Duration = duration or 5, Icon = "ban" })
+end
+
+local function NotifyInfo(title, message, duration)
+    WindUI:Notify({ Title = title, Content = message, Duration = duration or 5, Icon = "info" })
+end
+
+local function NotifyWarning(title, message, duration)
+    WindUI:Notify({ Title = title, Content = message, Duration = duration or 5, Icon = "triangle-alert" })
+end
+
+-- =========================
+-- AUTO FAVOURITE
+-- =========================
+local function startAutoFavourite()
+    task.spawn(function()
+        while state.AutoFavourite do
+            pcall(function()
+                if not Replion or not ItemUtility then return end
+                local netFolder = getNetFolder()
+                local favoriteRemote = netFolder and netFolder:FindFirstChild("RE/FavoriteItem")
+                if not favoriteRemote then return end
+
+                local DataReplion = Replion.Client:WaitReplion("Data")
+                local items = DataReplion and DataReplion:Get({"Inventory","Items"})
+                if type(items) ~= "table" then return end
+                for _, item in ipairs(items) do
+                    local base = ItemUtility:GetItemData(item.Id)
+                    if base and base.Data and allowedTiers[base.Data.Tier] and not item.Favorited then
+                        favoriteRemote:FireServer(item.UUID)
+                        item.Favorited = true
+                    end
+                end
+            end)
+            task.wait(5)
+        end
+    end)
+end
+
+-- =========================
+-- AUTO SELL
+-- =========================
+local lastSellTime = 0
+local AUTO_SELL_THRESHOLD = 60
+local AUTO_SELL_DELAY = 60 
+
+local function startAutoSell()
+    task.spawn(function()
+        while state.AutoSell do
+            pcall(function()
+                if not Replion then return end
+                local DataReplion = Replion.Client:WaitReplion("Data")
+                local items = DataReplion and DataReplion:Get({"Inventory","Items"})
+                if type(items) ~= "table" then return end
+
+                local unfavoritedCount = 0
+                for _, item in ipairs(items) do
+                    if not item.Favorited then
+                        unfavoritedCount = unfavoritedCount + (item.Count or 1)
+                    end
+                end
+
+                if unfavoritedCount >= AUTO_SELL_THRESHOLD and os.time() - lastSellTime >= AUTO_SELL_DELAY then
+                    local netFolder = getNetFolder()
+                    if netFolder then
+                        local sellFunc = netFolder:FindFirstChild("RF/SellAllItems")
+                        if sellFunc then
+                            task.spawn(sellFunc.InvokeServer, sellFunc)
+                            lastSellTime = os.time()
+                        end
+                    end
+                end
+            end)
+            task.wait(10)
+        end
+    end)
+end
+
+-- =========================
+-- AUTO FISH V3
+-- =========================
+local autoFishLoop
+local function playCastAnim()
+    pcall(function()
+        if AnimationController and AnimationController.PlayAnimation then
+            AnimationController:PlayAnimation("CastFromFullChargePosition1Hand")
+        end
+    end)
+end
+
+local function startAutoFish()
+    if autoFishLoop then task.cancel(autoFishLoop) end
+    autoFishLoop = task.spawn(function()
+        local net = getNetFolder(); if not net then return end
+        local equipEvent = net:WaitForChild("RE/EquipToolFromHotbar")
+        local chargeFunc = net:WaitForChild("RF/ChargeFishingRod")
+        local startMini  = net:WaitForChild("RF/RequestFishingMinigameStarted")
+        local complete   = net:WaitForChild("RE/FishingCompleted")
+
+        while state.AutoFish do
+            if FishingController and FishingController.OnCooldown and FishingController:OnCooldown() then
+                repeat task.wait(0.2) until not (FishingController:OnCooldown()) or not state.AutoFish
+            end
+            if not state.AutoFish then break end
+
+            pcall(function()
+                playCastAnim()
+                equipEvent:FireServer(1)
+                task.wait(0.1)
+                chargeFunc:InvokeServer(workspace:GetServerTimeNow())
+                task.wait(0.1)
+                startMini:InvokeServer(-0.75, 1)
+                task.wait(0.2)
+                for i=1,20 do
+                    complete:FireServer()
+                    task.wait(0.05)
+                end
+            end)
+
+            local t = os.clock()
+            while os.clock() - t < 0.7 and state.AutoFish do task.wait() end -- delay 0.7s
+        end
+    end)
+end
+
+local function stopAutoFish()
+    if autoFishLoop then task.cancel(autoFishLoop); autoFishLoop = nil end
+end
+
+-- =========================
+-- TELEPORT FUNCTION
+-- =========================
+local function teleportTo(posList)
+    local char = player.Character or player.CharacterAdded:Wait()
+    local hrp = char:FindFirstChild("HumanoidRootPart") or char:WaitForChild("HumanoidRootPart")
+
+    if hrp then
+        local chosen
+        if typeof(posList) == "table" then
+            chosen = posList[math.random(1, #posList)]
+        else
+            chosen = posList
+        end
+        hrp.CFrame = chosen
+
+        -- 🔧 Added: restart AutoFish after short delay to fix teleport bug
+        task.delay(1.5, function()
+            if state.AutoFish then
+                stopAutoFish()
+                startAutoFish()
+            end
+        end)
+    end
+end
+
+-------------------------------------------
+----- =======[ LOAD WINDOW ]
+-------------------------------------------
+
+-- (rest of your script unchanged below)
